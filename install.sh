@@ -111,7 +111,7 @@ echo "==> relay files"
 mkdir -p "$APP_DIR"
 
 cat > "$APP_DIR/package.json" <<'PKGEOF'
-{ "name": "relay", "version": "1.0.0", "private": true, "main": "relay.js", "dependencies": { "ws": "^8.18.0" } }
+{ "name": "relay", "version": "1.0.0", "private": true, "main": "relay.js", "dependencies": { "ws": "^8.18.0", "bufferutil": "^4.0.8" } }
 PKGEOF
 
 cat > "$APP_DIR/relay.js" <<'RELAYEOF'
@@ -195,22 +195,33 @@ function bridgeTcp(ws, target) {
   const tcp = net.connect(target.port, target.host);
   tcp.setNoDelay(true);
   try { ws._socket.setNoDelay(true); } catch (e) {}
-  let closed = false;
+  let done = false;
+
+  function cleanup() {
+    if (done) { return; }
+    done = true;
+    try { tcp.destroy(); } catch (e) {}
+    try { if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) { ws.terminate(); } } catch (e) {}
+  }
+
+  // клиент -> бэкенд
   ws.on('message', function (data) {
     if (tcp.writable) {
       if (tcp.write(data) === false) {
-        ws._socket.pause();
-        tcp.once('drain', function () { if (!closed) { ws._socket.resume(); } });
+        try { ws._socket.pause(); } catch (e) {}
+        tcp.once('drain', function () { if (!done) { try { ws._socket.resume(); } catch (e) {} } });
       }
     }
   });
+
+  // бэкенд -> клиент
   tcp.on('data', function (data) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(data, { binary: true });
       if (ws.bufferedAmount > (512 * 1024) && !tcp.isPaused()) {
         tcp.pause();
         (function check() {
-          if (closed) { return; }
+          if (done) { return; }
           if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount > (256 * 1024)) {
             setTimeout(check, 20);
           } else {
@@ -220,11 +231,29 @@ function bridgeTcp(ws, target) {
       }
     }
   });
-  function close() {
-    if (!closed) { closed = true; try { ws.close(); } catch (e) {} try { tcp.destroy(); } catch (e) {} }
-  }
-  ws.on('close', close); ws.on('error', close);
-  tcp.on('close', close); tcp.on('error', close);
+
+  // бэкенд прислал FIN (half-close): дольём буфер клиенту, затем мягко закроем ws
+  tcp.on('end', function () {
+    try { if (ws.readyState === WebSocket.OPEN) { ws.close(); } } catch (e) {}
+  });
+
+  // клиент закрыл ws: мягкий FIN бэкенду (даём долить ожидающие записи), затем страховка
+  ws.on('close', function () {
+    try { tcp.end(); } catch (e) {}
+    setTimeout(cleanup, 10000);
+  });
+
+  // ошибки -> жёсткое закрытие
+  ws.on('error', cleanup);
+  tcp.on('error', cleanup);
+
+  // бэкенд полностью закрылся
+  tcp.on('close', function () {
+    if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount === 0) {
+      try { ws.close(); } catch (e) {}
+    }
+    setTimeout(cleanup, 10000);
+  });
 }
 
 function bridgeUdp(ws, target) {
