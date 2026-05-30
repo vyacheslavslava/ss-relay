@@ -147,6 +147,8 @@ server.on('upgrade', function (req, socket, head) {
 
 function bridgeTcp(ws, target) {
   const tcp = net.connect(target.port, target.host);
+  tcp.setNoDelay(true);
+  try { ws._socket.setNoDelay(true); } catch (e) {}
   let closed = false;
   ws.on('message', function (data) {
     if (tcp.writable) {
@@ -252,6 +254,11 @@ server {
 
     ssl_certificate     ${CERT_DIR}/fullchain.pem;
     ssl_certificate_key ${CERT_DIR}/privkey.pem;
+
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1h;
+    ssl_session_tickets on;
+    tcp_nodelay on;
 
     location / {
         proxy_pass http://127.0.0.1:${RELAY_PORT};
