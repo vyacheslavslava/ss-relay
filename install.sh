@@ -207,7 +207,7 @@ function bridgeTcp(ws, target) {
   tcp.on('data', function (data) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(data, { binary: true });
-      if (ws.bufferedAmount > (256 * 1024) && !tcp.isPaused()) {
+      if (ws.bufferedAmount > (512 * 1024) && !tcp.isPaused()) {
         tcp.pause();
         ws._socket.once('drain', function () { if (!closed) { tcp.resume(); } });
       }
