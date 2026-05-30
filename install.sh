@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# WS-relay installer. Usage:
-#   sudo env API_URL='https://...' API_AUTH='...' bash -s -- <domain> [email]
+# WS-relay installer (stateless, encrypted-path). Usage:
+#   sudo env RELAY_KEY='<64 hex>' bash -s -- <domain> [email]
+# Same RELAY_KEY must be set on the config generator.
 set -euo pipefail
 
 DOMAIN="${1:-}"
 EMAIL="${2:-}"
-API_URL="${API_URL:-}"
-API_AUTH="${API_AUTH:-}"
+RELAY_KEY="${RELAY_KEY:-}"
 
 APP_DIR="/opt/relay"
 NODE_MAJOR="20"
@@ -20,13 +20,13 @@ if [ -z "$DOMAIN" ]; then
   echo "Pass domain as first argument." >&2
   exit 1
 fi
-if [ -z "$API_URL" ] || [ -z "$API_AUTH" ]; then
-  echo "Set API_URL and API_AUTH via env:" >&2
-  echo "  sudo env API_URL='https://...' API_AUTH='...' bash -s -- $DOMAIN" >&2
+if ! printf '%s' "$RELAY_KEY" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+  echo "Set RELAY_KEY to 64 hex chars (openssl rand -hex 32):" >&2
+  echo "  sudo env RELAY_KEY='<64 hex>' bash -s -- $DOMAIN" >&2
   exit 1
 fi
 
-echo "==> domain: $DOMAIN | api: $API_URL"
+echo "==> domain: $DOMAIN"
 
 MYIP="$(curl -fsS https://api.ipify.org || true)"
 DNSIP="$(getent hosts "$DOMAIN" | awk '{print $1}' | head -n1 || true)"
@@ -78,73 +78,44 @@ cat > "$APP_DIR/package.json" <<'PKGEOF'
   "name": "relay",
   "version": "1.0.0",
   "private": true,
-  "main": "relay-api.js",
+  "main": "relay.js",
   "dependencies": { "ws": "^8.18.0" }
 }
 PKGEOF
 
-cat > "$APP_DIR/relay-api.js" <<'RELAYEOF'
+cat > "$APP_DIR/relay.js" <<'RELAYEOF'
 'use strict';
 
 const http = require('http');
-const https = require('https');
 const net = require('net');
 const dgram = require('dgram');
-const { URL } = require('url');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 
-const API_URL     = process.env.API_URL  || '';
-const API_AUTH    = process.env.API_AUTH || '';
-const REFRESH_MS  = parseInt(process.env.REFRESH_MS || '30000', 10);
+const KEY         = Buffer.from(process.env.RELAY_KEY || '', 'hex');
 const LISTEN_PORT = process.env.PORT || 8080;
 const LISTEN_HOST = process.env.HOST || '127.0.0.1';
 
-let servers = new Map();
-
-function fetchJSON(urlStr, cb) {
-  let u;
-  try { u = new URL(urlStr); } catch (e) { cb(e); return; }
-  const mod = u.protocol === 'https:' ? https : http;
-  const opts = { method: 'GET', headers: { 'Authorization': API_AUTH } };
-  const req = mod.request(u, opts, function (res) {
-    let body = '';
-    res.on('data', function (c) { body += c; });
-    res.on('end', function () {
-      if (res.statusCode !== 200) {
-        cb(new Error('HTTP ' + res.statusCode));
-      } else {
-        let json;
-        try { json = JSON.parse(body); cb(null, json); }
-        catch (e) { cb(e); }
-      }
-    });
-  });
-  req.on('error', function (e) { cb(e); });
-  req.setTimeout(10000, function () { req.destroy(new Error('api timeout')); });
-  req.end();
+function unb64url(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) { s += '='; }
+  return Buffer.from(s, 'base64');
 }
 
-function loadServers(cb) {
-  fetchJSON(API_URL, function (err, list) {
-    if (err) {
-      console.error('servers load failed:', err.message);
-      if (cb) { cb(err); }
-    } else if (!Array.isArray(list)) {
-      console.error('servers: not an array');
-      if (cb) { cb(new Error('bad payload')); }
-    } else {
-      const next = new Map();
-      for (let i = 0; i < list.length; i++) {
-        const s = list[i];
-        if (s && s.id != null && s.host && s.port) {
-          next.set(String(s.id), { host: s.host, port: s.port });
-        }
-      }
-      servers = next;
-      console.log('servers loaded:', servers.size);
-      if (cb) { cb(null); }
-    }
-  });
+function open(token) {
+  let raw;
+  try { raw = unb64url(token); } catch (e) { return null; }
+  if (raw.length < 12 + 16) { return null; }
+  const iv = raw.subarray(0, 12);
+  const tag = raw.subarray(raw.length - 16);
+  const ct = raw.subarray(12, raw.length - 16);
+  try {
+    const d = crypto.createDecipheriv('aes-256-gcm', KEY, iv);
+    d.setAuthTag(tag);
+    return Buffer.concat([d.update(ct), d.final()]).toString('utf8');
+  } catch (e) {
+    return null;
+  }
 }
 
 const server = http.createServer();
@@ -157,21 +128,28 @@ server.on('request', function (req, res) {
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', function (req, socket, head) {
-  const clean = req.url.replace(/^\/+/, '').split('?')[0];
-  const parts = clean.split('/');
-  const mode = parts.pop();
-  const id = parts.join('/');
-  const target = servers.get(id);
-
-  if (!target) {
-    socket.destroy();
-  } else if (mode !== 'tcp' && mode !== 'udp') {
+  const seg = req.url.replace(/^\/+/, '').split('?')[0].split('/')[0];
+  const pt = open(seg);
+  if (pt === null) {
     socket.destroy();
   } else {
-    wss.handleUpgrade(req, socket, head, function (ws) {
-      if (mode === 'tcp') { bridgeTcp(ws, target); }
-      else { bridgeUdp(ws, target); }
-    });
+    const parts = pt.split('|');
+    const mode = parts[0];
+    const host = parts[1];
+    const port = parseInt(parts[2], 10);
+    const exp = parts[3] ? parseInt(parts[3], 10) : 0;
+    if (mode !== 'tcp' && mode !== 'udp') {
+      socket.destroy();
+    } else if (!host || !port) {
+      socket.destroy();
+    } else if (exp && (Date.now() / 1000) > exp) {
+      socket.destroy();
+    } else {
+      wss.handleUpgrade(req, socket, head, function (ws) {
+        if (mode === 'tcp') { bridgeTcp(ws, { host: host, port: port }); }
+        else { bridgeUdp(ws, { host: host, port: port }); }
+      });
+    }
   }
 });
 
@@ -226,21 +204,14 @@ function bridgeUdp(ws, target) {
   udp.on('error', close);
 }
 
-function boot() {
-  loadServers(function (err) {
-    if (err) {
-      console.error('initial load failed, retry in 5s');
-      setTimeout(boot, 5000);
-    } else {
-      server.listen(LISTEN_PORT, LISTEN_HOST, function () {
-        console.log('relay up on ' + LISTEN_HOST + ':' + LISTEN_PORT);
-      });
-      setInterval(function () { loadServers(); }, REFRESH_MS);
-    }
-  });
+if (KEY.length !== 32) {
+  console.error('RELAY_KEY must be 32 bytes hex (openssl rand -hex 32)');
+  process.exit(1);
 }
 
-boot();
+server.listen(LISTEN_PORT, LISTEN_HOST, function () {
+  console.log('relay up on ' + LISTEN_HOST + ':' + LISTEN_PORT);
+});
 RELAYEOF
 
 echo "==> npm install"
@@ -287,8 +258,8 @@ nginx -t && systemctl reload nginx
 
 echo "==> pm2 start"
 cd "$APP_DIR"
-API_URL="$API_URL" API_AUTH="$API_AUTH" pm2 start relay-api.js --name relay --update-env || \
-API_URL="$API_URL" API_AUTH="$API_AUTH" pm2 restart relay --update-env
+RELAY_KEY="$RELAY_KEY" pm2 start relay.js --name relay --update-env || \
+RELAY_KEY="$RELAY_KEY" pm2 restart relay --update-env
 pm2 save
 pm2 startup systemd -u root --hp /root >/dev/null 2>&1 || true
 
@@ -296,6 +267,5 @@ echo
 echo "==> done. checks:"
 sleep 2
 pm2 list | sed -n '1,20p' || true
-echo "API:"; curl -fsS -H "Authorization: ${API_AUTH}" "$API_URL" | head -c 200; echo
 echo -n "HTTPS (expect 404): "; curl -s -o /dev/null -w "%{http_code}\n" "https://${DOMAIN}/"
-echo "relay on https://${DOMAIN}  paths: /<ID>/tcp /<ID>/udp  | logs: pm2 logs relay"
+echo "relay on https://${DOMAIN}  | logs: pm2 logs relay"
