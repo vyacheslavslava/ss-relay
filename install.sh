@@ -1,19 +1,8 @@
 #!/usr/bin/env bash
-#
-# install.sh — разворачивает WebSocket-релей (входную ноду) на чистом Ubuntu.
-# Ставит Node 20, PM2, nginx, certbot; пишет релей; берёт TLS; поднимает под PM2.
-# Без генерации конфигов — чистый маршрутизатор WS -> Shadowsocks-бэкенд.
-#
-# Использование:
-#   sudo env API_URL='...' API_AUTH='...' bash -s -- <домен> [email]
-#
-# Обязательно через env:
-#   API_URL   — эндпоинт со списком серверов
-#   API_AUTH  — значение заголовка Authorization
-#
+# WS-relay installer. Usage:
+#   sudo env API_URL='https://...' API_AUTH='...' bash -s -- <domain> [email]
 set -euo pipefail
 
-# ───────────────────────── параметры ──────────────────────────────────────
 DOMAIN="${1:-}"
 EMAIL="${2:-}"
 API_URL="${API_URL:-}"
@@ -23,78 +12,52 @@ APP_DIR="/opt/relay"
 NODE_MAJOR="20"
 RELAY_PORT="8080"
 
-# ───────────────────────── проверки ───────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Запускай от root (sudo)." >&2
+  echo "Run as root (sudo)." >&2
   exit 1
 fi
-
 if [ -z "$DOMAIN" ]; then
-  echo "Укажи домен первым аргументом." >&2
+  echo "Pass domain as first argument." >&2
+  exit 1
+fi
+if [ -z "$API_URL" ] || [ -z "$API_AUTH" ]; then
+  echo "Set API_URL and API_AUTH via env:" >&2
+  echo "  sudo env API_URL='https://...' API_AUTH='...' bash -s -- $DOMAIN" >&2
   exit 1
 fi
 
-if [ -z "$API_URL" ]; then
-  echo "Не задан API_URL (эндпоинт со списком серверов)." >&2
-  echo "Передай через env: sudo env API_URL='https://...' API_AUTH='...' bash -s -- $DOMAIN" >&2
-  exit 1
-fi
+echo "==> domain: $DOMAIN | api: $API_URL"
 
-if [ -z "$API_AUTH" ]; then
-  echo "Не задан API_AUTH (секрет заголовка Authorization)." >&2
-  echo "Передай через env: sudo env API_URL='https://...' API_AUTH='...' bash -s -- $DOMAIN" >&2
-  exit 1
-fi
-
-echo "==> Домен:   $DOMAIN"
-echo "==> API:     $API_URL"
-echo "==> Каталог: $APP_DIR"
-
-# Проверим DNS (предупреждение, не блок).
 MYIP="$(curl -fsS https://api.ipify.org || true)"
 DNSIP="$(getent hosts "$DOMAIN" | awk '{print $1}' | head -n1 || true)"
 if [ -n "$MYIP" ] && [ -n "$DNSIP" ] && [ "$MYIP" != "$DNSIP" ]; then
-  echo "!!  ВНИМАНИЕ: A-запись $DOMAIN ($DNSIP) != IP сервера ($MYIP)."
-  echo "!!  certbot не выдаст сертификат, пока DNS не указывает сюда."
-  echo "!!  За Cloudflare — DNS only (серое облако)."
+  echo "!!  A-record $DOMAIN ($DNSIP) != server IP ($MYIP). certbot will fail until DNS points here."
 fi
 
-# ───────────────────────── освободить порты (если был Caddy) ──────────────
-if command -v caddy >/dev/null 2>&1; then
-  echo "==> Останавливаю Caddy"
-  systemctl stop caddy 2>/dev/null || true
-  systemctl disable caddy 2>/dev/null || true
-  pkill -9 caddy 2>/dev/null || true
-fi
-
-# ───────────────────────── система + пакеты ───────────────────────────────
-echo "==> apt update + базовые пакеты"
+echo "==> packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y curl git ufw ca-certificates
+apt-get install -y curl ufw ca-certificates
 
-echo "==> Node $NODE_MAJOR"
+echo "==> node $NODE_MAJOR"
 if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/v\([0-9]*\).*/\1/')" -lt 18 ]; then
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
   apt-get install -y nodejs
 fi
-node -v
 
-echo "==> PM2"
+echo "==> pm2"
 npm install -g pm2 >/dev/null 2>&1 || npm install -g pm2
 
 echo "==> nginx + certbot"
 apt-get install -y nginx certbot python3-certbot-nginx
 
-# ───────────────────────── фаервол ────────────────────────────────────────
-echo "==> ufw 22/80/443"
-ufw allow OpenSSH       >/dev/null 2>&1 || ufw allow 22/tcp
-ufw allow 80/tcp        >/dev/null 2>&1 || true
-ufw allow 443/tcp       >/dev/null 2>&1 || true
+echo "==> firewall"
+ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp
+ufw allow 80/tcp  >/dev/null 2>&1 || true
+ufw allow 443/tcp >/dev/null 2>&1 || true
 ufw --force enable
 
-# ───────────────────────── файлы релея ────────────────────────────────────
-echo "==> Пишу релей в $APP_DIR"
+echo "==> relay files"
 mkdir -p "$APP_DIR"
 
 cat > "$APP_DIR/package.json" <<'PKGEOF'
@@ -110,12 +73,6 @@ PKGEOF
 cat > "$APP_DIR/relay-api.js" <<'RELAYEOF'
 'use strict';
 
-// Входная нода: WebSocket -> Shadowsocks-бэкенд. Список серверов из API.
-// Путь = id сервера. Тупой WS<->TCP/UDP мост, без генерации конфигов.
-//   /<ID>/tcp   — WS-stream -> TCP
-//   /<ID>/udp   — WS-packet -> UDP
-//   прочее      — 404 (декой)
-
 const http = require('http');
 const https = require('https');
 const net = require('net');
@@ -129,7 +86,7 @@ const REFRESH_MS  = parseInt(process.env.REFRESH_MS || '30000', 10);
 const LISTEN_PORT = process.env.PORT || 8080;
 const LISTEN_HOST = process.env.HOST || '127.0.0.1';
 
-let servers = new Map(); // id -> { host, port }
+let servers = new Map();
 
 function fetchJSON(urlStr, cb) {
   let u;
@@ -160,7 +117,7 @@ function loadServers(cb) {
       console.error('servers load failed:', err.message);
       if (cb) { cb(err); }
     } else if (!Array.isArray(list)) {
-      console.error('servers: API вернул не массив');
+      console.error('servers: not an array');
       if (cb) { cb(new Error('bad payload')); }
     } else {
       const next = new Map();
@@ -276,8 +233,7 @@ RELAYEOF
 echo "==> npm install"
 ( cd "$APP_DIR" && npm install --omit=dev )
 
-# ───────────────────────── nginx ──────────────────────────────────────────
-echo "==> nginx site"
+echo "==> nginx"
 cat > /etc/nginx/sites-available/relay <<NGINXEOF
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
@@ -308,7 +264,6 @@ rm -f /etc/nginx/sites-enabled/default
 nginx -t
 systemctl restart nginx
 
-# ───────────────────────── TLS ────────────────────────────────────────────
 echo "==> certbot"
 if [ -n "$EMAIL" ]; then
   certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" --redirect
@@ -317,21 +272,17 @@ else
 fi
 nginx -t && systemctl reload nginx
 
-# ───────────────────────── PM2 ────────────────────────────────────────────
-echo "==> PM2"
+echo "==> pm2 start"
 cd "$APP_DIR"
 API_URL="$API_URL" API_AUTH="$API_AUTH" pm2 start relay-api.js --name relay --update-env || \
 API_URL="$API_URL" API_AUTH="$API_AUTH" pm2 restart relay --update-env
 pm2 save
 pm2 startup systemd -u root --hp /root >/dev/null 2>&1 || true
 
-# ───────────────────────── проверка ───────────────────────────────────────
 echo
-echo "==> Готово. Проверка:"
+echo "==> done. checks:"
 sleep 2
-echo "--- pm2 ---";       pm2 list | sed -n '1,20p' || true
-echo "--- API ---";       curl -fsS -H "Authorization: ${API_AUTH}" "$API_URL" | head -c 300; echo
-echo "--- HTTPS (ждём 404) ---"; curl -s -o /dev/null -w "%{http_code}\n" "https://${DOMAIN}/"
-echo
-echo "Фронт поднят на https://${DOMAIN} . WS-пути: /<ID>/tcp и /<ID>/udp"
-echo "Логи релея:  pm2 logs relay"
+pm2 list | sed -n '1,20p' || true
+echo "API:"; curl -fsS -H "Authorization: ${API_AUTH}" "$API_URL" | head -c 200; echo
+echo -n "HTTPS (expect 404): "; curl -s -o /dev/null -w "%{http_code}\n" "https://${DOMAIN}/"
+echo "relay on https://${DOMAIN}  paths: /<ID>/tcp /<ID>/udp  | logs: pm2 logs relay"
