@@ -54,6 +54,31 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y curl ufw ca-certificates
 
+echo "==> kernel/network tuning"
+cat > /etc/sysctl.d/99-relay.conf <<'SYSCTLEOF'
+# высокая нагрузка по соединениям (релей открывает много исходящих к бэкендам)
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_slow_start_after_idle = 0
+fs.file-max = 2097152
+SYSCTLEOF
+# BBR — только если модуль есть в ядре, иначе остаётся cubic
+modprobe tcp_bbr 2>/dev/null || true
+if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+  echo "net.core.default_qdisc = fq" >> /etc/sysctl.d/99-relay.conf
+  echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.d/99-relay.conf
+  echo "    bbr enabled"
+else
+  echo "    bbr not available, keeping default"
+fi
+sysctl --system >/dev/null 2>&1 || true
+
 echo "==> node $NODE_MAJOR"
 if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/v\([0-9]*\).*/\1/')" -lt 18 ]; then
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
@@ -298,6 +323,11 @@ else
 fi
 # worker_connections внутри events {}
 sed -i 's/worker_connections[[:space:]]*[0-9]*;/worker_connections 65535;/' /etc/nginx/nginx.conf
+
+# systemd-лимит fd для nginx (иначе worker_rlimit_nofile упрётся в него)
+mkdir -p /etc/systemd/system/nginx.service.d
+printf '[Service]\nLimitNOFILE=1048576\n' > /etc/systemd/system/nginx.service.d/limits.conf
+systemctl daemon-reload
 
 nginx -t
 systemctl enable nginx >/dev/null 2>&1 || true
