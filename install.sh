@@ -205,12 +205,16 @@ function bridgeTcp(ws, target) {
   }
 
   // клиент -> бэкенд
+  let waitingDrain = false;
   ws.on('message', function (data) {
-    if (tcp.writable) {
-      if (tcp.write(data) === false) {
-        try { ws._socket.pause(); } catch (e) {}
-        tcp.once('drain', function () { if (!done) { try { ws._socket.resume(); } catch (e) {} } });
-      }
+    if (!tcp.writable) { return; }
+    if (tcp.write(data) === false && !waitingDrain) {
+      waitingDrain = true;
+      try { ws._socket.pause(); } catch (e) {}
+      tcp.once('drain', function () {
+        waitingDrain = false;
+        if (!done) { try { ws._socket.resume(); } catch (e) {} }
+      });
     }
   });
 
