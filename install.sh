@@ -38,6 +38,17 @@ if command -v docker >/dev/null 2>&1; then
   done
 fi
 
+echo "==> disabling certbot auto-renew (old scheme, if present)"
+# мы раздаём wildcard через API; certbot renew не нужен и может перезаписать nginx-конфиг
+for unit in certbot.timer certbot-renewal.timer snap.certbot.renew.timer; do
+  systemctl disable --now "$unit" >/dev/null 2>&1 || true
+done
+# вычистить cron-задания certbot, если были
+if command -v crontab >/dev/null 2>&1; then
+  ( crontab -l 2>/dev/null | grep -v certbot ) | crontab - 2>/dev/null || true
+fi
+rm -f /etc/cron.d/certbot 2>/dev/null || true
+
 echo "==> packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
