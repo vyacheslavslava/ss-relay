@@ -276,6 +276,18 @@ NGINXEOF
 
 ln -sf /etc/nginx/sites-available/relay /etc/nginx/sites-enabled/relay
 rm -f /etc/nginx/sites-enabled/default
+
+# ── тюнинг воркеров nginx (по умолчанию 768 коннектов — мало под нагрузкой) ──
+# worker_processes по ядрам, поднимаем лимит соединений и file descriptors
+sed -i 's/^worker_processes.*/worker_processes auto;/' /etc/nginx/nginx.conf
+if grep -q '^worker_rlimit_nofile' /etc/nginx/nginx.conf; then
+  sed -i 's/^worker_rlimit_nofile.*/worker_rlimit_nofile 1048576;/' /etc/nginx/nginx.conf
+else
+  sed -i '1i worker_rlimit_nofile 1048576;' /etc/nginx/nginx.conf
+fi
+# worker_connections внутри events {}
+sed -i 's/worker_connections[[:space:]]*[0-9]*;/worker_connections 65535;/' /etc/nginx/nginx.conf
+
 nginx -t
 systemctl enable nginx >/dev/null 2>&1 || true
 systemctl restart nginx
