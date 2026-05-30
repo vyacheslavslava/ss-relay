@@ -34,6 +34,19 @@ if [ -n "$MYIP" ] && [ -n "$DNSIP" ] && [ "$MYIP" != "$DNSIP" ]; then
   echo "!!  A-record $DOMAIN ($DNSIP) != server IP ($MYIP). certbot will fail until DNS points here."
 fi
 
+echo "==> disabling Outline (if present)"
+if command -v docker >/dev/null 2>&1; then
+  for c in shadowbox watchtower; do
+    if docker ps -a --format '{{.Names}}' | grep -qx "$c"; then
+      docker update --restart=no "$c" >/dev/null 2>&1 || true
+      docker stop "$c" >/dev/null 2>&1 || true
+      echo "    stopped $c"
+    fi
+  done
+else
+  echo "    docker not found, skip"
+fi
+
 echo "==> packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
