@@ -67,17 +67,27 @@ net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_slow_start_after_idle = 0
 fs.file-max = 2097152
+# против bufferbloat (раздутые очереди -> высокий пинг под нагрузкой)
+net.core.default_qdisc = fq_codel
 SYSCTLEOF
-# BBR — только если модуль есть в ядре, иначе остаётся cubic
+# BBR — если модуль есть; BBR лучше работает с fq, тогда меняем qdisc на fq
+QDISC="fq_codel"
 modprobe tcp_bbr 2>/dev/null || true
 if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-  echo "net.core.default_qdisc = fq" >> /etc/sysctl.d/99-relay.conf
+  sed -i 's/^net.core.default_qdisc.*/net.core.default_qdisc = fq/' /etc/sysctl.d/99-relay.conf
   echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.d/99-relay.conf
-  echo "    bbr enabled"
+  QDISC="fq"
+  echo "    bbr enabled (qdisc fq)"
 else
-  echo "    bbr not available, keeping default"
+  echo "    bbr not available, qdisc fq_codel"
 fi
 sysctl --system >/dev/null 2>&1 || true
+# применить qdisc на живой интерфейс сразу (без ребута)
+IFACE=$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')
+if [ -n "$IFACE" ]; then
+  tc qdisc replace dev "$IFACE" root $QDISC 2>/dev/null || true
+  echo "    qdisc $QDISC on $IFACE"
+fi
 
 echo "==> node $NODE_MAJOR"
 if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/v\([0-9]*\).*/\1/')" -lt 18 ]; then
@@ -197,8 +207,10 @@ function bridgeTcp(ws, target) {
   tcp.on('data', function (data) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(data, { binary: true });
-      if (ws.bufferedAmount > (1 << 20)) { tcp.pause(); }
-      else if (tcp.isPaused()) { tcp.resume(); }
+      if (ws.bufferedAmount > (256 * 1024) && !tcp.isPaused()) {
+        tcp.pause();
+        ws._socket.once('drain', function () { if (!closed) { tcp.resume(); } });
+      }
     }
   });
   function close() {
