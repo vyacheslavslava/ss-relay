@@ -235,7 +235,6 @@ server {
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
-    http2 on;
     server_name ${DOMAIN};
 
     ssl_certificate     ${CERT_DIR}/fullchain.pem;
