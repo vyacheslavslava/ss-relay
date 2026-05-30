@@ -74,6 +74,7 @@ const http = require('http');
 const net = require('net');
 const dgram = require('dgram');
 const crypto = require('crypto');
+const { URL } = require('url');
 const WebSocket = require('ws');
 
 const KEY         = Buffer.from(process.env.RELAY_KEY || '', 'hex');
@@ -101,8 +102,20 @@ function open(token) {
 
 const server = http.createServer();
 server.on('request', function (req, res) {
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end('Not Found');
+  const u = new URL(req.url, 'http://x');
+  if (u.pathname === '/ping') {
+    const code = u.searchParams.get('code');
+    if (!code) {
+      res.writeHead(302, { 'Location': '/' });
+      res.end();
+    } else {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('' + parseInt(code, 10));
+    }
+  } else {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found');
+  }
 });
 
 const wss = new WebSocket.Server({ noServer: true });
