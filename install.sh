@@ -2,6 +2,7 @@
 # WS-relay installer (stateless, encrypted-path). Usage:
 #   sudo env RELAY_KEY='<64 hex>' bash -s -- <domain> [email]
 # Same RELAY_KEY must be set on the config generator.
+# Safe to rerun: reinstalls / updates the relay in place (no manual cleanup).
 set -euo pipefail
 
 DOMAIN="${1:-}"
@@ -246,6 +247,7 @@ NGINXEOF
 ln -sf /etc/nginx/sites-available/relay /etc/nginx/sites-enabled/relay
 rm -f /etc/nginx/sites-enabled/default
 nginx -t
+systemctl enable nginx >/dev/null 2>&1 || true
 systemctl restart nginx
 
 echo "==> certbot"
@@ -258,8 +260,8 @@ nginx -t && systemctl reload nginx
 
 echo "==> pm2 start"
 cd "$APP_DIR"
-RELAY_KEY="$RELAY_KEY" pm2 start relay.js --name relay --update-env || \
-RELAY_KEY="$RELAY_KEY" pm2 restart relay --update-env
+pm2 delete relay >/dev/null 2>&1 || true
+RELAY_KEY="$RELAY_KEY" pm2 start relay.js --name relay --update-env
 pm2 save
 pm2 startup systemd -u root --hp /root >/dev/null 2>&1 || true
 
