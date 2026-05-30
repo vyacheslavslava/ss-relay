@@ -209,7 +209,14 @@ function bridgeTcp(ws, target) {
       ws.send(data, { binary: true });
       if (ws.bufferedAmount > (512 * 1024) && !tcp.isPaused()) {
         tcp.pause();
-        ws._socket.once('drain', function () { if (!closed) { tcp.resume(); } });
+        (function check() {
+          if (closed) { return; }
+          if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount > (256 * 1024)) {
+            setTimeout(check, 20);
+          } else {
+            try { tcp.resume(); } catch (e) {}
+          }
+        })();
       }
     }
   });
