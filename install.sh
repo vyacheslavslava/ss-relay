@@ -126,6 +126,9 @@ const WebSocket = require('ws');
 const KEY         = Buffer.from(process.env.RELAY_KEY || '', 'hex');
 const LISTEN_PORT = process.env.PORT || 8080;
 const LISTEN_HOST = process.env.HOST || '127.0.0.1';
+// пороги backpressure (можно переопределить env при старте)
+const BUF_HIGH = parseInt(process.env.WS_BUFFER_HIGH || (1024 * 1024), 10); // пауза чтения с бэкенда
+const BUF_LOW  = parseInt(process.env.WS_BUFFER_LOW  || (512 * 1024), 10);  // возобновление
 
 function unb64url(s) {
   s = s.replace(/-/g, '+').replace(/_/g, '/');
@@ -222,11 +225,11 @@ function bridgeTcp(ws, target) {
   tcp.on('data', function (data) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(data, { binary: true });
-      if (ws.bufferedAmount > (512 * 1024) && !tcp.isPaused()) {
+      if (ws.bufferedAmount > BUF_HIGH && !tcp.isPaused()) {
         tcp.pause();
         (function check() {
           if (done) { return; }
-          if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount > (256 * 1024)) {
+          if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount > BUF_LOW) {
             setTimeout(check, 20);
           } else {
             try { tcp.resume(); } catch (e) {}
